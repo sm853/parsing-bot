@@ -31,6 +31,7 @@ Steps for notify_failure:
 
 from __future__ import annotations
 
+import html
 import logging
 
 import httpx
@@ -116,7 +117,7 @@ def notify_failure(job_id: int, chat_id: int) -> None:
 
     text = (
         "❌ <b>Parsing failed.</b>\n\n"
-        f"Reason: {error_msg or 'Unknown error'}\n\n"
+        f"Reason: {html.escape(error_msg or 'Unknown error')}\n\n"
         "Your credit has been <b>refunded</b>. You can try again."
     )
     _send_step(job_id, STEP_FAILURE,  "failure_text",
@@ -202,12 +203,14 @@ def _send_document(chat_id: int, file_content: bytes, filename: str) -> None:
 def _send_after_parse_keyboard(chat_id: int) -> None:
     """Send the after-parse inline keyboard as a plain JSON call."""
     kb = after_parse_kb()
+    payload = kb.model_dump(exclude_none=True)
+    logger.info("_send_after_parse_keyboard: chat=%s payload=%s", chat_id, payload)
     response = httpx.post(
         f"{_BASE}/sendMessage",
         json={
             "chat_id": chat_id,
             "text": "What would you like to do next?",
-            "reply_markup": kb.model_dump(exclude_none=True),  # exclude nulls — avoids 400
+            "reply_markup": payload,
         },
         timeout=30,
     )
