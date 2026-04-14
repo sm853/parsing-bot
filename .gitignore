@@ -1,0 +1,59 @@
+# ── Secrets — NEVER COMMIT ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Telethon session files ────────────────────────────────────────────────────
+# These files contain your logged-in Telegram account credentials.
+# Committing them is equivalent to committing your Telegram account password.
+*.session
+*.session-journal
+sessions/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyd
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+.Python
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Docker local overrides ────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Alembic SQLite test databases ────────────────────────────────────────────
+*.db
+
+# ── CSV exports (parse results) ───────────────────────────────────────────────
+*.csv

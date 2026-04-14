@@ -1,0 +1,30 @@
+# Bot framework
+aiogram==3.7.0
+aiogram[redis]          # includes redis + aioredis FSM storage
+
+# Task queue
+celery==5.3.6
+redis==5.0.1
+
+# Database — async (bot process)
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+
+# Database — sync (Celery worker)
+psycopg2-binary==2.9.9
+
+# Migrations
+alembic==1.13.1
+
+# Telegram parsing
+telethon==1.35.0
+
+# HTTP client for worker→Bot API calls (delivery layer)
+httpx==0.27.0
+
+# Config
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# Async file I/O (used by Telethon internally)
+aiofiles==23.2.1
