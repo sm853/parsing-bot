@@ -111,14 +111,11 @@ def run_parse_job(
         # _parse() connects it, runs the parse, and disconnects — all within
         # this single asyncio.run() call and its event loop.
         worker_session = get_worker_session_path()
-        session_exists = (
-            os.path.exists(worker_session + ".session")
-            or os.path.exists(worker_session)
-        )
+        session_exists = os.path.exists(worker_session + ".session")
         logger.info(
-            "run_parse_job: worker session_path=%r  file_exists=%s  "
+            "run_parse_job: worker session_file=%r  file_exists=%s  "
             "job_id=%d celery_request_id=%s",
-            worker_session, session_exists, job_id, self.request.id,
+            worker_session + ".session", session_exists, job_id, self.request.id,
         )
         result = asyncio.run(_parse(channel_username, post_limit))
 
