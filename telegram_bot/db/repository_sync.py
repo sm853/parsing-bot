@@ -170,6 +170,35 @@ def mark_result_delivered_if_not_yet(session: Session, job_id: int) -> bool:
     return claimed_id is not None
 
 
+def claim_delivery_step(session: Session, job_id: int, step_col: str) -> bool:
+    """
+    Atomically claim one delivery step by setting its flag True.
+    Returns True  if this call claimed it (caller must execute the send).
+    Returns False if already True (step already done — caller must skip).
+    Safe under concurrent retries: only one caller wins the UPDATE.
+    """
+    result = session.execute(
+        update(ParseJob)
+        .where(and_(ParseJob.id == job_id, getattr(ParseJob, step_col).is_(False)))
+        .values({step_col: True})
+        .returning(ParseJob.id)
+    )
+    claimed_id = result.scalar_one_or_none()
+    session.commit()
+    return claimed_id is not None
+
+
+def reset_delivery_step(session: Session, job_id: int, step_col: str) -> None:
+    """
+    Reset one delivery step flag after a send failure so the next retry
+    can re-attempt it. Only called from delivery._send_step on exception.
+    """
+    session.execute(
+        update(ParseJob).where(ParseJob.id == job_id).values({step_col: False})
+    )
+    session.commit()
+
+
 def conditional_refund_credit(session: Session, job_id: int) -> bool:
     """
     IDEMPOTENT + TRANSACTIONAL refund guard.

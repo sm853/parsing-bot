@@ -7,23 +7,31 @@ Results are already in DB when this task runs.
 Separated from parse_task so that:
   - Delivery can be retried on Telegram API errors without re-running the parse
   - A Telegram outage does not count as a parsing failure
-  - User can (in future) request re-delivery of any completed job
 
 Retry policy: up to 3 attempts with exponential backoff (10s, 20s, 40s).
 
-Retry-safety:
-  Every call to delivery.notify_success / notify_failure reloads all data
-  from the DB and builds a fresh CSV.  No stream object or ORM reference is
-  shared between attempts — each retry is a clean start.
+Idempotency model (two layers)
+──────────────────────────────
+Layer 1 — job-level guard (this file):
+  result_delivered=True means ALL steps completed.  Task exits immediately
+  without calling delivery.py at all.
+
+Layer 2 — per-step guard (delivery.py / _send_step):
+  Each step (summary, document, keyboard) has its own DB boolean.
+  Atomic claim before send + reset on failure ensures each message is sent
+  at most once, even if deliver_task is retried after a partial delivery.
+
+On retry after partial failure:
+  result_delivered is still False (only set after all steps complete).
+  The task re-enters delivery.notify_success/notify_failure, which skips
+  completed steps and re-attempts only the failed one.
+  No message is ever sent twice.
 """
 
 import logging
 import traceback
 
-from sqlalchemy import update
-
 from telegram_bot.db.engine import get_sync_session
-from telegram_bot.db.models import ParseJob
 import telegram_bot.db.repository_sync as repo
 from telegram_bot.services import delivery
 from telegram_bot.tasks.celery_app import celery_app
@@ -45,20 +53,13 @@ def deliver_result(self, job_id: int, chat_id: int, outcome: str) -> None:
     Send parse result or failure message to the user.
 
     Args:
-        job_id:  ParseJob primary key (results are loaded from DB here)
-        chat_id: Telegram chat ID to send messages to
+        job_id:  ParseJob primary key
+        chat_id: Telegram chat ID
         outcome: "success" | "failure"
 
-    On Telegram API error: retries up to 3× with exponential backoff.
-    Credit status and job status are NOT modified here — they were finalised
-    by parse_task before this task was enqueued.
-
-    Idempotency guard: mark_result_delivered_if_not_yet() atomically claims
-    the delivery slot before any Telegram API call.  If the slot is already
-    taken (Celery retry after a successful send, or duplicate task), this
-    task exits immediately without re-sending.
-
-    Every retry builds the CSV fresh from DB — no stale / closed BytesIO.
+    Guards:
+      result_delivered=True  → all steps done, skip entirely
+      per-step flags in DB   → resume from first incomplete step on retry
     """
     attempt = self.request.retries + 1
     max_attempts = self.max_retries + 1
@@ -68,54 +69,40 @@ def deliver_result(self, job_id: int, chat_id: int, outcome: str) -> None:
         job_id, outcome, chat_id, attempt, max_attempts,
     )
 
-    # ── Idempotency guard ─────────────────────────────────────────────────────
-    # Atomically claim the delivery slot.  Only ONE invocation wins; all
-    # subsequent calls (retries or duplicates) see result_delivered=True and
-    # exit without touching Telegram.
-    logger.info(
-        "deliver_result: CLAIMING slot  job=%s outcome=%s attempt=%d/%d",
-        job_id, outcome, attempt, max_attempts,
-    )
+    # ── Layer 1 guard: skip if already fully delivered ────────────────────────
     with get_sync_session() as session:
-        claimed = repo.mark_result_delivered_if_not_yet(session, job_id)
-
-    if not claimed:
-        logger.warning(
-            "deliver_result: SKIP  job=%s already delivered — duplicate or "
-            "retry after a successful send (outcome=%s, attempt=%d/%d)",
-            job_id, outcome, attempt, max_attempts,
-        )
-        return
-
-    logger.info(
-        "deliver_result: SLOT CLAIMED  job=%s outcome=%s — calling notify",
-        job_id, outcome,
-    )
+        job = repo.get_job(session, job_id)
+        if job is None:
+            logger.error("deliver_result: ABORT  job=%s not found in DB", job_id)
+            return
+        if job.result_delivered:
+            logger.warning(
+                "deliver_result: SKIP  job=%s already fully delivered  "
+                "outcome=%s attempt=%d/%d",
+                job_id, outcome, attempt, max_attempts,
+            )
+            return
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
         if outcome == "success":
-            logger.info(
-                "deliver_result: calling notify_success  job=%s chat=%s",
-                job_id, chat_id,
-            )
             delivery.notify_success(job_id, chat_id)
         else:
-            logger.info(
-                "deliver_result: calling notify_failure  job=%s chat=%s",
-                job_id, chat_id,
-            )
             delivery.notify_failure(job_id, chat_id)
 
+        # All steps completed — mark the whole delivery done.
+        with get_sync_session() as session:
+            repo.mark_result_delivered_if_not_yet(session, job_id)
+
         logger.info(
-            "deliver_result: OK  job=%s outcome=%s chat=%s attempt=%d/%d",
+            "deliver_result: DONE  job=%s outcome=%s chat=%s attempt=%d/%d",
             job_id, outcome, chat_id, attempt, max_attempts,
         )
 
     except Exception as exc:
-        # Delivery failed AFTER we claimed the slot.
-        # Reset the flag so the next retry can re-claim and re-attempt.
-        # This is the ONLY place we reset result_delivered.
+        # delivery._send_step already reset the failed step's flag.
+        # result_delivered stays False — the retry will re-enter and resume
+        # from the first incomplete step without re-sending earlier ones.
         logger.warning(
             "deliver_result: FAIL  job=%s outcome=%s chat=%s "
             "attempt=%d/%d  error=%s\n%s",
@@ -124,26 +111,4 @@ def deliver_result(self, job_id: int, chat_id: int, outcome: str) -> None:
             exc,
             traceback.format_exc(),
         )
-
-        # Reset delivery slot so the retry gets a fresh start
-        try:
-            with get_sync_session() as session:
-                session.execute(
-                    update(ParseJob)
-                    .where(ParseJob.id == job_id)
-                    .values(result_delivered=False, delivered_at=None)
-                )
-                session.commit()
-            logger.info(
-                "deliver_result: slot reset for retry — job=%s attempt=%d/%d",
-                job_id, attempt, max_attempts,
-            )
-        except Exception as reset_exc:
-            # Log but do not suppress — still schedule the retry
-            logger.error(
-                "deliver_result: failed to reset delivery slot for job=%s: %s",
-                job_id, reset_exc,
-            )
-
-        # Exponential backoff: 10s → 20s → 40s
         raise self.retry(exc=exc, countdown=10 * (2 ** self.request.retries))

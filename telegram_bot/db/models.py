@@ -90,11 +90,17 @@ class ParseJob(Base):
     processing_started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Delivery idempotency guard — prevents duplicate notifications on Celery retry.
-    # deliver_task atomically flips this from False → True (WHERE result_delivered=False).
-    # If it returns False, the task skips sending and logs a warning.
+    # Delivery idempotency guard — set True only after ALL delivery steps complete.
     result_delivered = Column(Boolean, default=False, nullable=False)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Per-step delivery progress — allows retries to resume from the failed step
+    # without re-sending steps that already succeeded.
+    # Each flag is atomically claimed before the send and reset on failure.
+    delivery_summary_sent  = Column(Boolean, default=False, nullable=False)
+    delivery_document_sent = Column(Boolean, default=False, nullable=False)
+    delivery_keyboard_sent = Column(Boolean, default=False, nullable=False)
+    delivery_failure_sent  = Column(Boolean, default=False, nullable=False)
 
     bot_user = relationship("BotUser", back_populates="jobs")
     posts = relationship("PostResult", back_populates="job", cascade="all, delete-orphan")

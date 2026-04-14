@@ -163,22 +163,23 @@ class TestDeliverTaskIdempotency:
         notify = MagicMock()
         call_count = {"n": 0}
 
-        def fake_guard(s, jid):
+        def fake_mark(s, jid):
             call_count["n"] += 1
             return mark_result_delivered_if_not_yet(s, jid)
 
         with (
             patch.object(dt, "get_sync_session", self._make_session_ctx(session)),
-            patch.object(dt.repo, "mark_result_delivered_if_not_yet", fake_guard),
+            patch.object(dt.repo, "mark_result_delivered_if_not_yet", fake_mark),
             patch.object(dt.delivery, "notify_success", notify),
             patch.object(dt.delivery, "notify_failure", notify),
         ):
             dt.deliver_result.__wrapped__(self._make_task_self(), job_id, 42, "success")
             dt.deliver_result.__wrapped__(self._make_task_self(), job_id, 42, "success")
 
-        # notify called exactly once — second run hit the guard and returned early
+        # notify called exactly once — second run saw result_delivered=True and returned early
         notify.assert_called_once()
-        assert call_count["n"] == 2  # guard was checked twice
+        # mark_result_delivered_if_not_yet called once — at end of first successful delivery only
+        assert call_count["n"] == 1
 
 
 # ── parse_orchestrator.start_parsing structured result ────────────────────────

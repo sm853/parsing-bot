@@ -280,9 +280,10 @@ class TestFullDeliveryPipeline:
     deliver_result called twice for the same job produces exactly one
     notify_success call and exactly one document send.
 
-    The second invocation hits the idempotency guard
-    (mark_result_delivered_if_not_yet returns False) and exits without
-    calling notify_success at all.
+    Guard mechanism (new): deliver_result reads job.result_delivered at the
+    START of each invocation.  After the first call completes all steps and
+    marks result_delivered=True, the second invocation sees True and exits
+    without calling notify_success at all.
     """
 
     @staticmethod
@@ -303,8 +304,8 @@ class TestFullDeliveryPipeline:
     def test_two_invocations_call_notify_once(self, db_session):
         """
         Two deliver_result calls for the same job:
-          - first: claims slot → calls notify_success
-          - second: slot taken → exits immediately, notify_success NOT called again
+          - first: result_delivered=False → calls notify_success → marks True
+          - second: result_delivered=True → exits immediately, notify_success NOT called
         """
         import telegram_bot.tasks.deliver_task as dt
 

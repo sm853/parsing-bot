@@ -7,25 +7,26 @@ parse_task NEVER calls the Telegram API directly.
 Both functions are synchronous (called from Celery workers).
 They use httpx to call the Telegram Bot API over HTTP.
 
-Architecture note:
-  Parsing task (parse_task)   →  data processing only, zero Telegram I/O
-  Delivery task (deliver_task) → calls notify_success / notify_failure here
-  These two tasks are separate Celery jobs so delivery can be retried
-  independently if Telegram has a temporary outage.
+Step-idempotency contract
+─────────────────────────
+Each outbound Telegram call is wrapped in _send_step(), which:
+  1. Atomically claims a per-step DB flag before sending
+     (UPDATE … SET step=True WHERE step=False RETURNING id)
+  2. If claimed → executes the send
+  3. On send failure → resets the flag so the retry can re-attempt only this step
+  4. If not claimed → step already done, skip silently
 
-Retry-safety contract
-─────────────────────
-Every call to notify_success() is self-contained:
-  1. Load posts fresh from DB (no cached ORM objects carried between retries)
-  2. Build summary text
-  3. Build CSV → immediately extract bytes via .getvalue()
-  4. Send summary message
-  5. Send CSV document (bytes, not a live stream object)
-  6. Send after-parse keyboard
+This guarantees each user-visible message is sent at most once even across
+multiple Celery retries.  Earlier steps are never re-sent on retry.
 
-Using bytes (not BytesIO) for sendDocument ensures:
-  - No "I/O operation on closed file" even if the buffer goes out of scope
-  - Retries start from a clean slate — no consumed / partially-read stream
+Steps for notify_success:
+  1. summary_text         → delivery_summary_sent
+  2. csv_document         → delivery_document_sent
+  3. after_parse_keyboard → delivery_keyboard_sent
+
+Steps for notify_failure:
+  1. failure_text         → delivery_failure_sent
+  2. after_parse_keyboard → delivery_keyboard_sent
 """
 
 from __future__ import annotations
@@ -36,7 +37,11 @@ import httpx
 
 from telegram_bot.config import settings
 from telegram_bot.db.engine import get_sync_session
-from telegram_bot.db.repository_sync import get_job_with_posts
+from telegram_bot.db.repository_sync import (
+    get_job_with_posts,
+    claim_delivery_step,
+    reset_delivery_step,
+)
 from telegram_bot.keyboards.after_parse import after_parse_kb
 from telegram_bot.services import report
 
@@ -44,43 +49,35 @@ logger = logging.getLogger(__name__)
 
 _BASE = f"https://api.telegram.org/bot{settings.BOT_TOKEN}"
 
+# Column names for each delivery step — must match ParseJob Boolean columns.
+STEP_SUMMARY  = "delivery_summary_sent"
+STEP_DOCUMENT = "delivery_document_sent"
+STEP_KEYBOARD = "delivery_keyboard_sent"
+STEP_FAILURE  = "delivery_failure_sent"
+
 
 def notify_success(job_id: int, chat_id: int) -> None:
     """
-    Load results from DB, build report, send to user via Bot API.
+    Send 3 messages for a successful parse. Step-idempotent.
 
-    Sends three messages in order:
-      1. Text summary  (channel averages)
-      2. CSV document  (full post data)
-      3. After-parse keyboard  (Parse another / Exit)
+    Steps:
+      1. summary text  (STEP_SUMMARY)
+      2. CSV document  (STEP_DOCUMENT)
+      3. keyboard      (STEP_KEYBOARD)
 
-    Every call is fully self-contained: data is loaded fresh from DB, the CSV
-    is built fresh, and bytes are extracted before any network call.  This
-    makes the function safe to call multiple times (deliver_task retries).
-
-    Raises httpx.HTTPStatusError on Telegram API errors — deliver_task retries.
+    On Telegram API error: raises — deliver_task retries from the failed step only.
     """
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # Load data once — all three send steps use values captured here.
     with get_sync_session() as session:
         job = get_job_with_posts(session, job_id)
         if job is None:
-            logger.error("notify_success: job %s not found in DB — skipping delivery", job_id)
+            logger.error("notify_success: job %s not found in DB — skipping", job_id)
             return
 
         posts = job.posts  # eagerly loaded by get_job_with_posts (joinedload)
-
-        # Build report text while session is still open (ORM objects are live)
         summary = report.build_summary_text(job, posts)
-
-        # Build CSV and extract bytes IMMEDIATELY while the buffer is guaranteed open.
-        # getvalue() works even at position 0 — it reads the whole internal buffer.
         csv_buffer = report.build_csv(posts)
         csv_bytes = csv_buffer.getvalue()   # immutable bytes — safe outside this block
-
-        # Capture scalar attributes we need after the session closes.
-        # Scalar columns on detached objects are still accessible in SQLAlchemy,
-        # but capturing them explicitly documents the intent and avoids any risk
-        # of DetachedInstanceError on unusual SA configurations.
         channel_username = job.channel_username
         post_limit = job.post_limit
 
@@ -89,28 +86,28 @@ def notify_success(job_id: int, chat_id: int) -> None:
         job_id, channel_username, len(posts), len(csv_bytes), chat_id,
     )
 
-    # ── Send messages — each logged individually so duplicates are visible ────
-    logger.info("notify_success: sendMessage(summary)  job=%s chat=%s", job_id, chat_id)
-    _send_message(chat_id, summary)
+    _send_step(job_id, STEP_SUMMARY,  "summary_text",
+               lambda: _send_message(chat_id, summary))
 
     filename = f"channel_{channel_username}_{post_limit}_posts.csv"
-    logger.info(
-        "notify_success: sendDocument(%r)  job=%s chat=%s size=%d",
-        filename, job_id, chat_id, len(csv_bytes),
-    )
-    _send_document(chat_id, csv_bytes, filename)
+    _send_step(job_id, STEP_DOCUMENT, "csv_document",
+               lambda: _send_document(chat_id, csv_bytes, filename))
 
-    logger.info("notify_success: sendMessage(keyboard)  job=%s chat=%s", job_id, chat_id)
-    _send_after_parse_keyboard(chat_id)
+    _send_step(job_id, STEP_KEYBOARD, "after_parse_keyboard",
+               lambda: _send_after_parse_keyboard(chat_id))
 
     logger.info("notify_success: DONE  job=%s chat=%s", job_id, chat_id)
 
 
 def notify_failure(job_id: int, chat_id: int) -> None:
     """
-    Send an error notification to the user.
-    Called by deliver_task when parse_task sets status='failed'.
-    Credit has already been refunded by parse_task at this point.
+    Send failure notification. Step-idempotent.
+
+    Steps:
+      1. failure text  (STEP_FAILURE)
+      2. keyboard      (STEP_KEYBOARD)
+
+    Credit has already been refunded by parse_task before this is called.
     """
     with get_sync_session() as session:
         from telegram_bot.db.models import ParseJob  # local import to avoid circular
@@ -122,8 +119,49 @@ def notify_failure(job_id: int, chat_id: int) -> None:
         f"Reason: {error_msg or 'Unknown error'}\n\n"
         "Your credit has been <b>refunded</b>. You can try again."
     )
-    _send_message(chat_id, text)
-    _send_after_parse_keyboard(chat_id)
+    _send_step(job_id, STEP_FAILURE,  "failure_text",
+               lambda: _send_message(chat_id, text))
+    _send_step(job_id, STEP_KEYBOARD, "after_parse_keyboard",
+               lambda: _send_after_parse_keyboard(chat_id))
+
+
+# ── Step execution helper ──────────────────────────────────────────────────────
+
+def _send_step(
+    job_id: int,
+    step_col: str,
+    step_name: str,
+    send_fn,
+) -> None:
+    """
+    Atomically claim and execute one delivery step.
+
+    Claim:  UPDATE parse_jobs SET {step_col}=True
+            WHERE id=:job_id AND {step_col}=False  RETURNING id
+    If claimed  → call send_fn(); on send failure: reset flag for retry
+    If not claimed → step already done, skip silently
+
+    Guarantees: send_fn is called at most once per step even under concurrent retries.
+    """
+    with get_sync_session() as session:
+        claimed = claim_delivery_step(session, job_id, step_col)
+
+    if not claimed:
+        logger.info("_send_step: SKIP  job=%s step=%s (already done)", job_id, step_name)
+        return
+
+    logger.info("_send_step: SENDING  job=%s step=%s", job_id, step_name)
+    try:
+        send_fn()
+        logger.info("_send_step: OK  job=%s step=%s", job_id, step_name)
+    except Exception:
+        logger.warning(
+            "_send_step: FAILED  job=%s step=%s — resetting flag for retry",
+            job_id, step_name,
+        )
+        with get_sync_session() as session:
+            reset_delivery_step(session, job_id, step_col)
+        raise  # propagates to deliver_task for Celery retry scheduling
 
 
 # ── Internal HTTP helpers ──────────────────────────────────────────────────────
@@ -147,11 +185,6 @@ def _send_document(chat_id: int, file_content: bytes, filename: str) -> None:
                       any "I/O on closed file" risk — bytes are immutable and
                       have no stream position to lose.
         filename:     Name shown to the user in Telegram.
-
-    The files= dict format is the canonical httpx multipart upload:
-      (filename, content, mime_type)
-    httpx builds the Content-Disposition header from filename and the
-    Content-Type header from mime_type automatically.
     """
     logger.debug(
         "_send_document: chat=%s filename=%r size=%d bytes",
@@ -174,7 +207,7 @@ def _send_after_parse_keyboard(chat_id: int) -> None:
         json={
             "chat_id": chat_id,
             "text": "What would you like to do next?",
-            "reply_markup": kb.model_dump(),
+            "reply_markup": kb.model_dump(exclude_none=True),  # exclude nulls — avoids 400
         },
         timeout=30,
     )
@@ -203,7 +236,6 @@ def _check_response(method: str, chat_id: int, response: httpx.Response) -> None
         logger.info("%s → ok  chat=%s", method, chat_id)
         return
 
-    # Log full details before raising so the worker log captures everything
     logger.error(
         "%s failed — chat=%s  http_status=%s  ok=%s  body=%s",
         method, chat_id, response.status_code, ok, body,
