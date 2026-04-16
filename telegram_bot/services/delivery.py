@@ -43,7 +43,7 @@ from telegram_bot.db.repository_sync import (
     claim_delivery_step,
     reset_delivery_step,
 )
-from telegram_bot.keyboards.after_parse import after_parse_kb
+from telegram_bot.keyboards.after_parse import after_parse_kb_payload
 from telegram_bot.services import report
 
 logger = logging.getLogger(__name__)
@@ -202,8 +202,7 @@ def _send_document(chat_id: int, file_content: bytes, filename: str) -> None:
 
 def _send_after_parse_keyboard(chat_id: int) -> None:
     """Send the after-parse inline keyboard as a plain JSON call."""
-    kb = after_parse_kb()
-    payload = kb.model_dump(exclude_none=True)
+    payload = after_parse_kb_payload()
     logger.info("_send_after_parse_keyboard: chat=%s payload=%s", chat_id, payload)
     response = httpx.post(
         f"{_BASE}/sendMessage",
