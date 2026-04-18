@@ -70,6 +70,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  admin_dashboard:
+    build:
+      context: ./admin-dashboard
+      dockerfile: Dockerfile
+    container_name: parsing_bot_admin
+    environment:
+      DATABASE_URL: ${DATABASE_URL_SYNC}
+      ADMIN_SECRET: ${ADMIN_SECRET:-changeme}
+      NEXT_PUBLIC_SITE_URL: http://localhost:3001
+    ports:
+      - "3001:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:

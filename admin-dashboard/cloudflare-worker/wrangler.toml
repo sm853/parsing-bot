@@ -1,0 +1,9 @@
+name = "parsing-bot-admin-cron"
+main = "cron.ts"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["0 3 * * *"]   # daily at 03:00 UTC
+
+[vars]
+ADMIN_BASE_URL = "https://your-admin-domain.com"
