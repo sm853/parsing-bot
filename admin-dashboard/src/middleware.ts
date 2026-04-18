@@ -14,6 +14,9 @@ export function middleware(request: NextRequest) {
   const expected = process.env.ADMIN_SECRET;
 
   if (!expected || token !== expected) {
+    if (pathname.startsWith('/api/')) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
     const loginUrl = new URL('/login', request.url);
     loginUrl.searchParams.set('from', pathname);
     return NextResponse.redirect(loginUrl);
