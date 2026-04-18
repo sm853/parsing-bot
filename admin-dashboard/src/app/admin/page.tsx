@@ -12,7 +12,7 @@ function formatDuration(ms: number | null): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-export const revalidate = 60;
+export const dynamic = 'force-dynamic';
 
 export default async function AdminPage() {
   const [metrics, timeseries, channels, errors, latestRuns] = await Promise.all([

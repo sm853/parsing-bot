@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { NextRequest, NextResponse } from 'next/server';
 import { getRuns } from '@/lib/queries';
 import type { RunFilters, SessionStatus } from '@/lib/types';
