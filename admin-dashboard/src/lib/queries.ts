@@ -121,11 +121,15 @@ export async function getRuns(
   const total = countRows[0].total;
 
   const offset = (page - 1) * limit;
+  // Cast timestamps to text so pg returns strings instead of Date objects.
+  // date-fns parseISO() calls .split() internally and crashes on Date objects.
   const dataSql = `
     SELECT
       id, telegram_user_id, username, selected_channel,
       status, parsing_duration_ms, result_rows,
-      started_at, finished_at, error_code, attempts_count
+      started_at::text AS started_at,
+      finished_at::text AS finished_at,
+      error_code, attempts_count
     FROM parsing_sessions
     ${where}
     ORDER BY started_at DESC
@@ -208,7 +212,12 @@ export async function getSessionById(
   id: string
 ): Promise<(ParsingSession & { attempts: ParsingAttempt[] }) | null> {
   const sessionSql = `
-    SELECT * FROM parsing_sessions WHERE id = $1
+    SELECT *,
+      started_at::text  AS started_at,
+      finished_at::text AS finished_at,
+      created_at::text  AS created_at,
+      updated_at::text  AS updated_at
+    FROM parsing_sessions WHERE id = $1
   `;
   const sessions = await query<ParsingSession>(sessionSql, [id]);
   if (sessions.length === 0) return null;

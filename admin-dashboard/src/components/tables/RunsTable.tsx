@@ -16,9 +16,14 @@ function formatDuration(ms: number | null): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function formatDate(iso: string | null): string {
-  if (!iso) return '—';
-  return format(parseISO(iso), 'MMM d, HH:mm');
+function formatDate(value: string | Date | null | undefined): string {
+  if (!value) return '—';
+  try {
+    const d = typeof value === 'string' ? parseISO(value) : value;
+    return format(d, 'MMM d, HH:mm');
+  } catch {
+    return String(value).slice(0, 16);
+  }
 }
 
 const SKELETON_ROWS = 5;
