@@ -29,16 +29,25 @@ Error handling order mirrors stale cleanup in parse_orchestrator:
   1. update_job_status → 'failed' FIRST  (job is finalized before credit is released)
   2. refund_credit() SECOND              (credit returned only after job is closed)
   3. deliver_task.delay("failure")       (user is notified after state is final)
+
+Analytics integration
+─────────────────────
+Each successful guard pass opens one parsing_sessions row and one
+parsing_attempts row in the admin dashboard tables (separate from parse_jobs).
+All analytics writes are wrapped in try/except — if they fail, parsing continues
+unaffected.  The parse_jobs business flow is never interrupted by analytics.
 """
 
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 from telegram_bot.db.engine import get_sync_session
 from telegram_bot.db.models import ParseJob
 import telegram_bot.db.repository_sync as repo
+import telegram_bot.services.analytics as analytics
 from telegram_bot.parser.client import make_worker_client, get_worker_session_path
 from telegram_bot.parser.channel_parser import parse_channel
 from telegram_bot.services.limits_sync import consume_credit, refund_credit
@@ -78,6 +87,10 @@ def run_parse_job(
     # Reads current status before any mutation.  If the job is already terminal
     # (completed or failed), this is an acks_late re-delivery after a worker
     # crash — skip entirely.  This prevents double-parse and double-enqueue.
+    #
+    # _bot_user_id is captured here while the session is open so it can be
+    # passed to analytics after the session closes (job object becomes detached).
+    _bot_user_id: int | None = None
     with get_sync_session() as session:
         job = repo.get_job(session, job_id)
         if job is None:
@@ -104,7 +117,51 @@ def run_parse_job(
             "processing",
             processing_started_at=datetime.now(timezone.utc),
         )
+        _bot_user_id = job.bot_user_id  # capture before session closes
 
+    # ── Analytics: open session row + first attempt ───────────────────────────
+    # Both IDs start as None — all downstream analytics calls guard on is not None,
+    # so a failure here does not affect the parsing flow at all.
+    _analytics_session_id: int | None = None
+    _analytics_attempt_id: int | None = None
+    _task_start_mono = time.monotonic()  # used for duration_ms in both paths
+
+    try:
+        with get_sync_session() as asess:
+            # Resolve username for dashboard display (best-effort).
+            _bot_user = repo.get_bot_user(asess, _bot_user_id)
+            _username = (_bot_user.username if _bot_user else None) or ""
+
+            # One parsing_sessions row per parse_jobs row.
+            # parse_job_id stored in options so the dashboard can cross-reference.
+            _analytics_session_id = analytics.create_parsing_session(
+                asess,
+                telegram_user_id=_bot_user_id,
+                username=_username,
+                channel=channel_username,
+                post_limit=post_limit,
+                options={"parse_job_id": job_id, "chat_id": chat_id},
+            )
+            # Increment attempts_count before starting the attempt row so the
+            # count is always ≥ 1 when the attempt row is visible.
+            analytics.increment_session_attempts(asess, _analytics_session_id)
+
+            # One parsing_attempts row per Celery execution (attempt_number=1
+            # here because max_retries=0; structure ready for future retry paths).
+            _analytics_attempt_id = analytics.start_parsing_attempt(
+                asess,
+                session_id=_analytics_session_id,
+                attempt_number=self.request.retries + 1,
+                celery_task_id=self.request.id or "",
+            )
+    except Exception as _ana_exc:
+        logger.warning(
+            "run_parse_job: analytics open failed — continuing  "
+            "job_id=%d  error=%s",
+            job_id, _ana_exc,
+        )
+
+    # ── Main parsing flow ─────────────────────────────────────────────────────
     try:
         # Step 2: parse via Telethon.
         # make_worker_client() returns a fresh disconnected client every time.
@@ -133,6 +190,33 @@ def run_parse_job(
             "celery_request_id=%s",
             job_id, len(result.posts), channel_username, self.request.id,
         )
+
+        # ── Analytics: close attempt + session (success path) ─────────────────
+        _duration_ms = int((time.monotonic() - _task_start_mono) * 1000)
+        try:
+            if _analytics_attempt_id is not None:
+                with get_sync_session() as asess:
+                    analytics.complete_parsing_attempt(
+                        asess,
+                        attempt_id=_analytics_attempt_id,
+                        status="success",
+                        duration_ms=_duration_ms,
+                    )
+            if _analytics_session_id is not None:
+                with get_sync_session() as asess:
+                    analytics.complete_parsing_session(
+                        asess,
+                        session_id=_analytics_session_id,
+                        status="success",
+                        duration_ms=_duration_ms,
+                        result_rows=len(result.posts),
+                    )
+        except Exception as _ana_exc:
+            logger.warning(
+                "run_parse_job: analytics close (success) failed — continuing  "
+                "job_id=%d  error=%s",
+                job_id, _ana_exc,
+            )
 
         # Step 5: enqueue delivery (separate task — can retry independently)
         from telegram_bot.tasks.deliver_task import deliver_result  # noqa: PLC0415
@@ -165,6 +249,41 @@ def run_parse_job(
                     "run_parse_job: credit refunded  job_id=%d celery_request_id=%s",
                     job_id, self.request.id,
                 )
+
+        # ── Analytics: close attempt + session (failure path) ─────────────────
+        _duration_ms = int((time.monotonic() - _task_start_mono) * 1000)
+        try:
+            # Use the exception type as a short machine-readable error code.
+            # Truncate the message to 500 chars so it fits cleanly in the DB column.
+            _error_code = type(exc).__name__
+            _error_msg = str(exc)[:500]
+
+            if _analytics_attempt_id is not None:
+                with get_sync_session() as asess:
+                    analytics.complete_parsing_attempt(
+                        asess,
+                        attempt_id=_analytics_attempt_id,
+                        status="failed",
+                        duration_ms=_duration_ms,
+                        error_code=_error_code,
+                        error_message=_error_msg,
+                    )
+            if _analytics_session_id is not None:
+                with get_sync_session() as asess:
+                    analytics.complete_parsing_session(
+                        asess,
+                        session_id=_analytics_session_id,
+                        status="failed",
+                        duration_ms=_duration_ms,
+                        error_code=_error_code,
+                        error_message=_error_msg,
+                    )
+        except Exception as _ana_exc:
+            logger.warning(
+                "run_parse_job: analytics close (failure) failed — continuing  "
+                "job_id=%d  error=%s",
+                job_id, _ana_exc,
+            )
 
         # Step 5: notify user of failure
         from telegram_bot.tasks.deliver_task import deliver_result  # noqa: PLC0415
