@@ -26,8 +26,13 @@ def create_parsing_session(
     channel: str,
     post_limit: int,
     options: dict[str, Any],
+    parse_job_id: Optional[int] = None,
 ) -> int:
-    """Insert a new parsing_sessions row. Returns the new session id.
+    """Insert (or idempotently return) a parsing_sessions row.
+
+    Uses INSERT … ON CONFLICT (parse_job_id) so that acks_late re-deliveries
+    of the same Celery task never create a duplicate session row — the second
+    call returns the id of the row created by the first call.
 
     Args:
         session:          SQLAlchemy database session.
@@ -36,9 +41,11 @@ def create_parsing_session(
         channel:          Channel handle being parsed, e.g. '@crypto_news'.
         post_limit:       Maximum number of posts requested.
         options:          Arbitrary dict of additional options (stored as JSONB).
+        parse_job_id:     parse_jobs.id — used as the idempotency key.
+                          When provided, duplicate calls return the existing id.
 
     Returns:
-        The newly created session id (bigint).
+        The parsing_sessions id (new or existing).
     """
     sql = text("""
         INSERT INTO parsing_sessions (
@@ -50,7 +57,8 @@ def create_parsing_session(
             selected_options,
             attempts_count,
             created_at,
-            updated_at
+            updated_at,
+            parse_job_id
         ) VALUES (
             :telegram_user_id,
             :username,
@@ -60,8 +68,12 @@ def create_parsing_session(
             :options::jsonb,
             0,
             NOW(),
-            NOW()
+            NOW(),
+            :parse_job_id
         )
+        ON CONFLICT (parse_job_id)
+            WHERE parse_job_id IS NOT NULL
+            DO UPDATE SET updated_at = NOW()
         RETURNING id
     """)
     result = session.execute(
@@ -71,6 +83,7 @@ def create_parsing_session(
             "username": username or None,
             "channel": channel,
             "options": json.dumps({**(options or {}), "post_limit": post_limit}),
+            "parse_job_id": parse_job_id,
         },
     )
     session.commit()
@@ -84,18 +97,22 @@ def start_parsing_attempt(
     attempt_number: int,
     celery_task_id: str,
 ) -> int:
-    """Insert a parsing_attempts row with status='running'. Returns attempt id.
+    """Insert a parsing_attempts row and atomically increment attempts_count.
+
+    Both writes (attempt INSERT + session UPDATE) are committed together in a
+    single transaction, so attempts_count can never drift from the actual
+    number of attempt rows regardless of mid-flight worker crashes.
 
     Args:
         session:        SQLAlchemy database session.
         session_id:     Parent parsing_sessions.id.
-        attempt_number: 1-based attempt counter.
+        attempt_number: 1-based attempt counter (use self.request.retries + 1).
         celery_task_id: Celery task ID string for traceability.
 
     Returns:
         The newly created attempt id (bigint).
     """
-    sql = text("""
+    insert_sql = text("""
         INSERT INTO parsing_attempts (
             session_id,
             attempt_number,
@@ -114,16 +131,28 @@ def start_parsing_attempt(
         RETURNING id
     """)
     result = session.execute(
-        sql,
+        insert_sql,
         {
             "session_id": session_id,
             "attempt_number": attempt_number,
             "meta": json.dumps({"celery_task_id": celery_task_id}),
         },
     )
+    attempt_id = int(result.fetchone()[0])
+
+    # Increment the denormalized counter in the same transaction so it always
+    # equals COUNT(parsing_attempts WHERE session_id = :id).
+    session.execute(
+        text("""
+            UPDATE parsing_sessions
+            SET attempts_count = attempts_count + 1,
+                updated_at     = NOW()
+            WHERE id = :session_id
+        """),
+        {"session_id": session_id},
+    )
     session.commit()
-    row = result.fetchone()
-    return int(row[0])
+    return attempt_id
 
 
 def complete_parsing_attempt(

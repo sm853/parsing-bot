@@ -133,26 +133,51 @@ def run_parse_job(
             _username = (_bot_user.username if _bot_user else None) or ""
 
             # One parsing_sessions row per parse_jobs row.
-            # parse_job_id stored in options so the dashboard can cross-reference.
+            # parse_job_id is the idempotency key: ON CONFLICT returns the
+            # existing id on acks_late re-delivery instead of creating a duplicate.
+            logger.info(
+                "analytics: create_parsing_session  job_id=%d  action=open",
+                job_id,
+            )
             _analytics_session_id = analytics.create_parsing_session(
                 asess,
                 telegram_user_id=_bot_user_id,
                 username=_username,
                 channel=channel_username,
                 post_limit=post_limit,
-                options={"parse_job_id": job_id, "chat_id": chat_id},
+                options={"chat_id": chat_id},
+                parse_job_id=job_id,
             )
-            # Increment attempts_count before starting the attempt row so the
-            # count is always ≥ 1 when the attempt row is visible.
-            analytics.increment_session_attempts(asess, _analytics_session_id)
+            logger.info(
+                "analytics: create_parsing_session  job_id=%d  "
+                "analytics_session_id=%d  action=open  result=ok",
+                job_id, _analytics_session_id,
+            )
 
-            # One parsing_attempts row per Celery execution (attempt_number=1
-            # here because max_retries=0; structure ready for future retry paths).
+            # start_parsing_attempt atomically inserts the attempt row AND
+            # increments attempts_count in one commit — no two-commit race.
+            # attempt_number uses self.request.retries+1; with max_retries=0 this
+            # is always 1 for normal flow. On acks_late re-delivery it is still 1
+            # (Celery doesn't increment retries for acks_late), so both runs show
+            # attempt_number=1 — acceptable, since the session row is reused (no
+            # duplicate) and the attempt count correctly reflects two executions.
+            _attempt_number = self.request.retries + 1
+            logger.info(
+                "analytics: start_parsing_attempt  job_id=%d  "
+                "analytics_session_id=%d  attempt_number=%d  action=open",
+                job_id, _analytics_session_id, _attempt_number,
+            )
             _analytics_attempt_id = analytics.start_parsing_attempt(
                 asess,
                 session_id=_analytics_session_id,
-                attempt_number=self.request.retries + 1,
+                attempt_number=_attempt_number,
                 celery_task_id=self.request.id or "",
+            )
+            logger.info(
+                "analytics: start_parsing_attempt  job_id=%d  "
+                "analytics_session_id=%d  analytics_attempt_id=%d  "
+                "attempt_number=%d  action=open  result=ok",
+                job_id, _analytics_session_id, _analytics_attempt_id, _attempt_number,
             )
     except Exception as _ana_exc:
         logger.warning(
@@ -195,6 +220,12 @@ def run_parse_job(
         _duration_ms = int((time.monotonic() - _task_start_mono) * 1000)
         try:
             if _analytics_attempt_id is not None:
+                logger.info(
+                    "analytics: complete_parsing_attempt  job_id=%d  "
+                    "analytics_session_id=%s  analytics_attempt_id=%d  "
+                    "action=close  status=success  duration_ms=%d",
+                    job_id, _analytics_session_id, _analytics_attempt_id, _duration_ms,
+                )
                 with get_sync_session() as asess:
                     analytics.complete_parsing_attempt(
                         asess,
@@ -202,7 +233,18 @@ def run_parse_job(
                         status="success",
                         duration_ms=_duration_ms,
                     )
+                logger.info(
+                    "analytics: complete_parsing_attempt  job_id=%d  "
+                    "analytics_attempt_id=%d  action=close  result=ok",
+                    job_id, _analytics_attempt_id,
+                )
             if _analytics_session_id is not None:
+                logger.info(
+                    "analytics: complete_parsing_session  job_id=%d  "
+                    "analytics_session_id=%d  action=close  status=success  "
+                    "duration_ms=%d  result_rows=%d",
+                    job_id, _analytics_session_id, _duration_ms, len(result.posts),
+                )
                 with get_sync_session() as asess:
                     analytics.complete_parsing_session(
                         asess,
@@ -211,6 +253,11 @@ def run_parse_job(
                         duration_ms=_duration_ms,
                         result_rows=len(result.posts),
                     )
+                logger.info(
+                    "analytics: complete_parsing_session  job_id=%d  "
+                    "analytics_session_id=%d  action=close  result=ok",
+                    job_id, _analytics_session_id,
+                )
         except Exception as _ana_exc:
             logger.warning(
                 "run_parse_job: analytics close (success) failed — continuing  "
@@ -253,12 +300,20 @@ def run_parse_job(
         # ── Analytics: close attempt + session (failure path) ─────────────────
         _duration_ms = int((time.monotonic() - _task_start_mono) * 1000)
         try:
-            # Use the exception type as a short machine-readable error code.
+            # Use the exception class name as a short machine-readable error code.
             # Truncate the message to 500 chars so it fits cleanly in the DB column.
             _error_code = type(exc).__name__
             _error_msg = str(exc)[:500]
 
             if _analytics_attempt_id is not None:
+                logger.info(
+                    "analytics: complete_parsing_attempt  job_id=%d  "
+                    "analytics_session_id=%s  analytics_attempt_id=%d  "
+                    "action=close  status=failed  duration_ms=%d  "
+                    "error_code=%s",
+                    job_id, _analytics_session_id, _analytics_attempt_id,
+                    _duration_ms, _error_code,
+                )
                 with get_sync_session() as asess:
                     analytics.complete_parsing_attempt(
                         asess,
@@ -268,7 +323,18 @@ def run_parse_job(
                         error_code=_error_code,
                         error_message=_error_msg,
                     )
+                logger.info(
+                    "analytics: complete_parsing_attempt  job_id=%d  "
+                    "analytics_attempt_id=%d  action=close  result=ok",
+                    job_id, _analytics_attempt_id,
+                )
             if _analytics_session_id is not None:
+                logger.info(
+                    "analytics: complete_parsing_session  job_id=%d  "
+                    "analytics_session_id=%d  action=close  status=failed  "
+                    "duration_ms=%d  error_code=%s",
+                    job_id, _analytics_session_id, _duration_ms, _error_code,
+                )
                 with get_sync_session() as asess:
                     analytics.complete_parsing_session(
                         asess,
@@ -278,6 +344,11 @@ def run_parse_job(
                         error_code=_error_code,
                         error_message=_error_msg,
                     )
+                logger.info(
+                    "analytics: complete_parsing_session  job_id=%d  "
+                    "analytics_session_id=%d  action=close  result=ok",
+                    job_id, _analytics_session_id,
+                )
         except Exception as _ana_exc:
             logger.warning(
                 "run_parse_job: analytics close (failure) failed — continuing  "
