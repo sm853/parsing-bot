@@ -29,9 +29,31 @@ Both files must be pre-authorized before first use:
 import logging
 import os
 
+import socks
 from telethon import TelegramClient
 
 from telegram_bot.config import settings
+
+
+def _proxy_kwargs() -> dict:
+    """Return proxy= kwarg for TelegramClient if TELEGRAM_PROXY_HOST is set."""
+    if not settings.TELEGRAM_PROXY_HOST or not settings.TELEGRAM_PROXY_PORT:
+        return {}
+    proxy = (
+        socks.SOCKS5,
+        settings.TELEGRAM_PROXY_HOST,
+        settings.TELEGRAM_PROXY_PORT,
+        True,
+        settings.TELEGRAM_PROXY_USER or "",
+        settings.TELEGRAM_PROXY_PASS or "",
+    )
+    logger.info(
+        "_proxy_kwargs: using SOCKS5 proxy %s:%s user=%r",
+        settings.TELEGRAM_PROXY_HOST,
+        settings.TELEGRAM_PROXY_PORT,
+        settings.TELEGRAM_PROXY_USER,
+    )
+    return {"proxy": proxy}
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +109,8 @@ def get_bot_client() -> TelegramClient:
     if _bot_client is None:
         session_path = get_bot_session_path()
         logger.info("get_bot_client: session_file=%r", session_path + ".session")
-        _bot_client = TelegramClient(session_path, settings.API_ID, settings.API_HASH)
+        _bot_client = TelegramClient(session_path, settings.API_ID, settings.API_HASH,
+                                     **_proxy_kwargs())
     return _bot_client
 
 
@@ -145,4 +168,5 @@ def make_worker_client() -> TelegramClient:
         session_path + ".session",
         os.environ.get("WORKER_SESSION_INDEX", "0"),
     )
-    return TelegramClient(session_path, settings.API_ID, settings.API_HASH)
+    return TelegramClient(session_path, settings.API_ID, settings.API_HASH,
+                          **_proxy_kwargs())

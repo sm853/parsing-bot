@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     STALE_PROCESSING_MINUTES: int = 10  # job stuck in 'processing'
     STALE_PENDING_MINUTES: int = 5      # job stuck in 'pending' (Celery never picked it up)
 
+    # Telegram proxy (SOCKS5) — required on servers where Telegram is blocked
+    TELEGRAM_PROXY_HOST: str | None = None
+    TELEGRAM_PROXY_PORT: int | None = None
+    TELEGRAM_PROXY_USER: str | None = None
+    TELEGRAM_PROXY_PASS: str | None = None
+
     # Environment
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
