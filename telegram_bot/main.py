@@ -42,19 +42,13 @@ async def on_shutdown(bot: Bot) -> None:
 def _make_bot_session() -> AiohttpSession | None:
     if not settings.TELEGRAM_PROXY_HOST or not settings.TELEGRAM_PROXY_PORT:
         return None
-    try:
-        from aiohttp_socks import ProxyConnector
-        proxy_url = (
-            f"socks5://{settings.TELEGRAM_PROXY_USER}:{settings.TELEGRAM_PROXY_PASS}"
-            f"@{settings.TELEGRAM_PROXY_HOST}:{settings.TELEGRAM_PROXY_PORT}"
-        )
-        connector = ProxyConnector.from_url(proxy_url)
-        logger.info("Bot HTTP session: using SOCKS5 proxy %s:%s",
-                    settings.TELEGRAM_PROXY_HOST, settings.TELEGRAM_PROXY_PORT)
-        return AiohttpSession(connector=connector)
-    except ImportError:
-        logger.warning("aiohttp-socks not installed — bot running without proxy")
-        return None
+    proxy_url = (
+        f"socks5://{settings.TELEGRAM_PROXY_USER}:{settings.TELEGRAM_PROXY_PASS}"
+        f"@{settings.TELEGRAM_PROXY_HOST}:{settings.TELEGRAM_PROXY_PORT}"
+    )
+    logger.info("Bot HTTP session: using SOCKS5 proxy %s:%s",
+                settings.TELEGRAM_PROXY_HOST, settings.TELEGRAM_PROXY_PORT)
+    return AiohttpSession(proxy=proxy_url)
 
 
 async def main() -> None:
