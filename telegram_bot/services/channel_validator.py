@@ -101,6 +101,15 @@ async def resolve_channel(client: TelegramClient, raw_input: str) -> ChannelMeta
     lookup = f"@{username}"
     logger.debug("resolve_channel: calling get_entity(%r)", lookup)
 
+    # Ensure the client is connected — reconnect if the connection dropped.
+    if not client.is_connected():
+        logger.info("resolve_channel: client disconnected, reconnecting…")
+        try:
+            await client.connect()
+        except Exception as e:
+            logger.error("resolve_channel: reconnect failed: %s", e)
+            raise ChannelNotFoundError(f"Telegram connection failed: {e}") from e
+
     # Verify the client is actually authorized before hitting the API.
     # An unauthorized client connects fine but fails on ResolveUsernameRequest.
     try:
